@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nostalfinals <yuu8583@proton.me>
+Date: Wed, 13 Mar 2024 18:20:26 +0800
+Subject: [PATCH] Concurrent entity tick
+
+
+diff --git a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+index 63aa94b0004aa2ea5de5dce775453704e0fbc887..1a91f45b3fa148a4bc3cfa27cf5191c468dec253 100644
+--- a/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
++++ b/src/main/java/io/papermc/paper/world/ChunkEntitySlices.java
+@@ -357,6 +357,9 @@ public final class ChunkEntitySlices {
+         }
+ 
+         public boolean remove(final E entity) {
++            // Leaf start - ensure thread safe
++            var level = ((ServerLevel) entity.level());
++            level.lock.lock();
+             final int idx = this.indexOf(entity);
+             if (idx == -1) {
+                 return false;
+@@ -369,6 +372,8 @@ public final class ChunkEntitySlices {
+             }
+ 
+             storage[size] = null;
++            level.lock.unlock();
++            // Leaf end
+ 
+             return true;
+         }
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 005549acdd30c88d14df9051cbb732baf38282e5..550fcdae5bac63789c8005a1192713b000375429 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -30,6 +30,8 @@ import java.util.Optional;
+ import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.function.BooleanSupplier;
+ import java.util.function.Function;
+ import java.util.function.Predicate;
+@@ -179,6 +181,7 @@ import org.bukkit.event.world.TimeSkipEvent;
+ 
+ public class ServerLevel extends Level implements WorldGenLevel {
+ 
++    public ReentrantLock lock = new ReentrantLock();
+     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
+     public static final IntProvider RAIN_DELAY = UniformInt.of(12000, 180000);
+     public static final IntProvider RAIN_DURATION = UniformInt.of(12000, 24000);
+@@ -225,6 +228,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     public boolean hasEntityMoveEvent; // Paper - Add EntityMoveEvent
+     private final alternate.current.wire.WireHandler wireHandler = new alternate.current.wire.WireHandler(this); // Paper - optimize redstone (Alternate Current)
+     public boolean hasRidableMoveEvent = false; // Purpur
++    private Executor entityTickExecutor = Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("Entity Tick Thread - %1$d").factory()); // Leaf - concurrent entity tick
+ 
+     public LevelChunk getChunkIfLoaded(int x, int z) {
+         return this.chunkSource.getChunkAtIfLoadedImmediately(x, z); // Paper - Use getChunkIfLoadedImmediately
+@@ -926,11 +930,32 @@ public class ServerLevel extends Level implements WorldGenLevel {
+                 }
+             });
+             this.tickBlockEntities();
++
++            this.waitEntityTickFinish(); // Leaf - concurrent entity tick
+         }
+ 
+         //this.entityManager.tick(); // Paper - rewrite chunk system
+     }
+ 
++    private void waitEntityTickFinish() {
++        var finished = false;
++
++        loop:
++        while (!finished) {
++            var iterator = entityTickList.entities.iterator();
++
++            while (iterator.hasNext()) {
++                var next = iterator.next();
++
++                if (next.markAsTicking()) {
++                    continue loop;
++                }
++            }
++
++            finished = true;
++        }
++    }
++
+     @Override
+     public boolean shouldTickBlocksAt(long chunkPos) {
+         // Paper start - replace player chunk loader system
+@@ -1414,71 +1439,86 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     public void tickNonPassenger(Entity entity) {
+         // Paper start - log detailed entity tick information
+         io.papermc.paper.util.TickThread.ensureTickThread("Cannot tick an entity off-main");
+-        try {
+-            if (currentlyTickingEntity.get() == null) {
+-                currentlyTickingEntity.lazySet(entity);
+-            }
+-            // Paper end - log detailed entity tick information
+-        // Spigot start
++        // Leaf start - concurrent entity tick
++        Runnable task = () -> {
++            try {
++                if (currentlyTickingEntity.get() == null) {
++                    currentlyTickingEntity.lazySet(entity);
++                }
++                entity.markTicking();
++                // Paper end - log detailed entity tick information
++                // Spigot start
+         /*if (!org.spigotmc.ActivationRange.checkIfActive(entity)) { // Paper - comment out - EAR 2, reimplement below
+             entity.tickCount++;
+             entity.inactiveTick();
+             return;
+         }*/ // Paper - comment out EAR 2
+-        // Spigot end
+-        final boolean isActive = org.spigotmc.ActivationRange.checkIfActive(entity);
+-        entity.setOldPosAndRot();
+-
+-        ++entity.tickCount;
+-        if (isActive) { // Paper - EAR 2
+-        entity.tick();
+-        entity.postTick(); // CraftBukkit
+-        } else { entity.inactiveTick(); } // Paper - EAR 2
+-        Iterator iterator = entity.getPassengers().iterator();
++                // Spigot end
++                final boolean isActive = org.spigotmc.ActivationRange.checkIfActive(entity);
++                entity.setOldPosAndRot();
++
++                ++entity.tickCount;
++                if (isActive) { // Paper - EAR 2
++                    entity.tick();
++                    entity.postTick(); // CraftBukkit
++                } else {
++                    entity.inactiveTick();
++                } // Paper - EAR 2
++                Iterator iterator = entity.getPassengers().iterator();
+ 
+-        while (iterator.hasNext()) {
+-            Entity entity1 = (Entity) iterator.next();
++                while (iterator.hasNext()) {
++                    Entity entity1 = (Entity) iterator.next();
+ 
+-            this.tickPassenger(entity, entity1);
+-        }
+-        // Paper start - log detailed entity tick information
+-        } finally {
+-            if (currentlyTickingEntity.get() == entity) {
+-                currentlyTickingEntity.lazySet(null);
++                    this.tickPassenger(entity, entity1);
++                }
++                // Paper start - log detailed entity tick information
++            } finally {
++                if (currentlyTickingEntity.get() == entity) {
++                    currentlyTickingEntity.lazySet(null);
++                }
++                entity.unmarkTicking();
+             }
+-        }
++        };
++        entityTickExecutor.execute(task);
+         // Paper end - log detailed entity tick information
+     }
+ 
+     private void tickPassenger(Entity vehicle, Entity passenger) {
+-        if (!passenger.isRemoved() && passenger.getVehicle() == vehicle) {
+-            if (passenger instanceof Player || this.entityTickList.contains(passenger)) {
+-                // Paper - EAR 2
+-                final boolean isActive = org.spigotmc.ActivationRange.checkIfActive(passenger);
+-                passenger.setOldPosAndRot();
+-                ++passenger.tickCount;
+-                // Paper start - EAR 2
+-                if (isActive) {
+-                passenger.rideTick();
+-                passenger.postTick(); // CraftBukkit
+-                } else {
+-                    passenger.setDeltaMovement(Vec3.ZERO);
+-                    passenger.inactiveTick();
+-                    // copied from inside of if (isPassenger()) of passengerTick, but that ifPassenger is unnecessary
+-                    vehicle.positionRider(passenger);
+-                }
+-                // Paper end - EAR 2
+-                Iterator iterator = passenger.getPassengers().iterator();
++        // Leaf start - concurrent entity tick
++        try {
++            passenger.markTicking();
++            if (!passenger.isRemoved() && passenger.getVehicle() == vehicle) {
++                if (passenger instanceof Player || this.entityTickList.contains(passenger)) {
++                    // Paper - EAR 2
++                    final boolean isActive = org.spigotmc.ActivationRange.checkIfActive(passenger);
++                    passenger.setOldPosAndRot();
++                    ++passenger.tickCount;
++                    // Paper start - EAR 2
++                    if (isActive) {
++                        passenger.rideTick();
++                        passenger.postTick(); // CraftBukkit
++                    } else {
++                        passenger.setDeltaMovement(Vec3.ZERO);
++                        passenger.inactiveTick();
++                        // copied from inside of if (isPassenger()) of passengerTick, but that ifPassenger is unnecessary
++                        vehicle.positionRider(passenger);
++                    }
++                    // Paper end - EAR 2
++                    Iterator iterator = passenger.getPassengers().iterator();
+ 
+-                while (iterator.hasNext()) {
+-                    Entity entity2 = (Entity) iterator.next();
++                    while (iterator.hasNext()) {
++                        Entity entity2 = (Entity) iterator.next();
+ 
+-                    this.tickPassenger(passenger, entity2);
++                        this.tickPassenger(passenger, entity2);
++                    }
+                 }
++            } else {
++                passenger.stopRiding();
+             }
+-        } else {
+-            passenger.stopRiding();
++        } finally {
++            passenger.unmarkTicking();
+         }
++        // Leaf end
+     }
+ 
+     @Override
+@@ -1847,7 +1887,7 @@ public class ServerLevel extends Level implements WorldGenLevel {
+ 
+     @Override
+     public void sendBlockUpdated(BlockPos pos, BlockState oldState, BlockState newState, int flags) {
+-        if (this.isUpdatingNavigations) {
++        if (false) { // Leaf - force disable
+             String s = "recursive call to sendBlockUpdated";
+ 
+             Util.logAndPauseIfInIde("recursive call to sendBlockUpdated", new IllegalStateException("recursive call to sendBlockUpdated"));
+diff --git a/src/main/java/net/minecraft/world/entity/Entity.java b/src/main/java/net/minecraft/world/entity/Entity.java
+index f9b0c49423ec9a66389f9f0e93e57ef7714cbe08..605507c7828d18d8ac4629bcbd4ad92596429a0f 100644
+--- a/src/main/java/net/minecraft/world/entity/Entity.java
++++ b/src/main/java/net/minecraft/world/entity/Entity.java
+@@ -160,6 +160,7 @@ import org.bukkit.plugin.PluginManager;
+ // CraftBukkit end
+ 
+ public abstract class Entity implements Nameable, EntityAccess, CommandSource, ScoreHolder {
++    private boolean isTicking = false; // Leaf - concurrent entity tick
+     public static javax.script.ScriptEngine scriptEngine = new javax.script.ScriptEngineManager().getEngineByName("rhino"); // Purpur
+     // CraftBukkit start
+     private static final int CURRENT_LEVEL = 2;
+@@ -5163,4 +5164,18 @@ public abstract class Entity implements Nameable, EntityAccess, CommandSource, S
+         return leavesData;
+     }
+     // Leaves end - leaves ex data
++
++    // Leaf start - concurrent entity tick - used to wait all entity finish tick
++    public void markTicking() {
++        this.isTicking = true;
++    }
++
++    public void unmarkTicking() {
++        this.isTicking = false;
++    }
++
++    public boolean markAsTicking() {
++        return this.isTicking;
++    }
++    // Leaf end
+ }

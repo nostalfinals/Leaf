@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nostalfinals <yuu8583@proton.me>
+Date: Wed, 13 Mar 2024 17:46:31 +0800
+Subject: [PATCH] Force to disable tick thread check
+
+
+diff --git a/src/main/java/io/papermc/paper/util/TickThread.java b/src/main/java/io/papermc/paper/util/TickThread.java
+index bdaf062f9b66ceab303a0807eca301342886a8ea..c866e749a3532dc3c0df9b04bf7707aaa4c6fefc 100644
+--- a/src/main/java/io/papermc/paper/util/TickThread.java
++++ b/src/main/java/io/papermc/paper/util/TickThread.java
+@@ -110,7 +110,8 @@ public class TickThread extends Thread {
+     }
+ 
+     public static boolean isTickThread() {
+-        return Thread.currentThread() instanceof TickThread;
++        // return Thread.currentThread() instanceof TickThread;
++        return true; // Leaf - force to disable thread check
+     }
+ 
+     public static boolean isShutdownThread() {
